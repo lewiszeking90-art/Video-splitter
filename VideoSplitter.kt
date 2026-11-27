@@ -2,22 +2,36 @@ package com.brayan.videosplitter
 
 import android.content.ContentValues
 import android.content.Context
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
-import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.OpenableColumns
-import java.nio.ByteBuffer
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import java.io.File
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.math.ceil
 
-data class VideoInfo(val name: String, val durationUs: Long)
+data class VideoInfo(val name: String, val durationMs: Long)
+
+/** segMs = durée d'une partie, parts = nombre de parties (la dernière va jusqu'à la fin). */
+data class Plan(val segMs: Long, val parts: Int)
 
 /**
- * Découpe SANS ré-encodage (MediaExtractor + MediaMuxer) : très rapide, aucune perte de qualité.
- * Les coupures tombent sur des images-clés, donc chaque partie dure environ la durée demandée.
+ * Découpe EXACTE (à la seconde près) avec Media3 Transformer.
+ * L'optimisation « trim » ne ré-encode que le début de chaque partie, le reste est copié tel quel.
  */
 object VideoSplitter {
 
@@ -33,86 +47,97 @@ object VideoSplitter {
         try {
             r.setDataSource(ctx, uri)
             val ms = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            return VideoInfo(name, ms * 1000L)
+            return VideoInfo(name, ms)
         } finally {
             r.release()
         }
     }
 
-    private fun rotationOf(ctx: Context, uri: Uri): Int {
-        val r = MediaMetadataRetriever()
-        return try {
-            r.setDataSource(ctx, uri)
-            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-        } catch (e: Exception) {
-            0
-        } finally {
-            r.release()
+    fun plan(durationMs: Long, byDuration: Boolean, n: Long): Plan? {
+        if (durationMs <= 0 || n <= 0) return null
+        if (byDuration) {
+            val seg = n * 1000L
+            var parts = ceil(durationMs.toDouble() / seg).toInt()
+            // un reste de moins d'une seconde est fusionné avec la partie précédente
+            if (parts > 1 && durationMs - (parts - 1) * seg < 1000L) parts--
+            return Plan(seg, maxOf(1, parts))
         }
+        if (n > 100_000) return null
+        val parts = n.toInt()
+        val seg = durationMs / parts
+        if (seg < 1000L) return null
+        return Plan(seg, parts)
     }
 
-    /** Retourne le nombre de parties créées. */
-    fun split(
+    /** Retourne les Uri des fichiers créés (dans Films/DecoupeurVideo). */
+    suspend fun split(
         ctx: Context,
         uri: Uri,
-        segmentUs: Long,
+        plan: Plan,
         baseName: String,
-        onProgress: (done: Int, total: Int) -> Unit,
-        isCancelled: () -> Boolean
-    ): Int {
-        // 1) Repérer toutes les images-clés de la piste vidéo
-        val scan = MediaExtractor()
-        val syncs = ArrayList<Long>()
-        try {
-            scan.setDataSource(ctx, uri, null)
-            val v = (0 until scan.trackCount).firstOrNull {
-                scan.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-            } ?: throw IllegalStateException("Aucune piste vidéo trouvée")
-            scan.selectTrack(v)
-            while (true) {
-                val t = scan.sampleTime
-                if (t < 0) break
-                if (scan.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) syncs.add(t)
-                scan.advance()
-            }
-        } finally {
-            scan.release()
-        }
-
-        // 2) Choisir les points de coupe (première image-clé >= cible)
-        val cuts = ArrayList<Long>()
-        cuts.add(0L)
-        var target = segmentUs
-        var i = 0
-        while (true) {
-            while (i < syncs.size && syncs[i] < target) i++
-            if (i >= syncs.size) break
-            val c = syncs[i]
-            if (c > cuts.last()) cuts.add(c)
-            target = c + segmentUs
-        }
-
-        val rotation = rotationOf(ctx, uri)
-        val total = cuts.size
+        onProgress: (done: Int, total: Int) -> Unit
+    ): List<Uri> {
         val stem = baseName.substringBeforeLast('.', baseName)
-        var done = 0
-        onProgress(0, total)
+        val results = ArrayList<Uri>()
+        onProgress(0, plan.parts)
 
-        for (k in 0 until total) {
-            if (isCancelled()) break
-            val start = cuts[k]
-            val end = if (k + 1 < total) cuts[k + 1] else Long.MAX_VALUE
-            val partName = "%s_partie_%03d.mp4".format(stem, k + 1)
-            writeSegment(ctx, uri, start, end, partName, rotation)
-            done++
-            onProgress(done, total)
+        for (k in 0 until plan.parts) {
+            val startMs = k * plan.segMs
+            val endMs = if (k == plan.parts - 1) C.TIME_END_OF_SOURCE else (k + 1) * plan.segMs
+            val tmp = File(ctx.cacheDir, "partie_tmp.mp4")
+            if (tmp.exists()) tmp.delete()
+            try {
+                exportClip(ctx, uri, startMs, endMs, tmp) // doit tourner sur le thread principal
+                val name = "%s_partie_%03d.mp4".format(stem, k + 1)
+                val out = withContext(Dispatchers.IO) { saveToGallery(ctx, tmp, name) }
+                results.add(out)
+            } finally {
+                tmp.delete()
+            }
+            onProgress(k + 1, plan.parts)
         }
-        return done
+        return results
     }
 
-    private fun writeSegment(
-        ctx: Context, uri: Uri, startUs: Long, endUs: Long, fileName: String, rotation: Int
-    ) {
+    private suspend fun exportClip(ctx: Context, uri: Uri, startMs: Long, endMs: Long, out: File) =
+        suspendCancellableCoroutine<Unit> { cont ->
+            val clip = MediaItem.ClippingConfiguration.Builder()
+                .setStartPositionMs(startMs)
+                .setEndPositionMs(endMs)
+                .build()
+            val item = MediaItem.Builder().setUri(uri).setClippingConfiguration(clip).build()
+            val edited = EditedMediaItem.Builder(item).build()
+
+            val builder = Transformer.Builder(ctx)
+            // Optimisation : ne ré-encoder que le début (si disponible dans cette version)
+            runCatching {
+                builder.javaClass
+                    .getMethod("experimentalSetTrimOptimizationEnabled", java.lang.Boolean.TYPE)
+                    .invoke(builder, true)
+            }
+            val transformer = builder
+                .addListener(object : Transformer.Listener {
+                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        if (cont.isActive) cont.resume(Unit)
+                    }
+
+                    override fun onError(
+                        composition: Composition,
+                        exportResult: ExportResult,
+                        exportException: ExportException
+                    ) {
+                        if (cont.isActive) cont.resumeWithException(exportException)
+                    }
+                })
+                .build()
+
+            cont.invokeOnCancellation {
+                Handler(Looper.getMainLooper()).post { transformer.cancel() }
+            }
+            transformer.start(edited, out.absolutePath)
+        }
+
+    private fun saveToGallery(ctx: Context, file: File, fileName: String): Uri {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -122,55 +147,9 @@ object VideoSplitter {
         val resolver = ctx.contentResolver
         val out = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
             ?: throw IllegalStateException("Impossible de créer le fichier de sortie")
-
-        val extractor = MediaExtractor()
-        var muxer: MediaMuxer? = null
-        var started = false
         try {
-            resolver.openFileDescriptor(out, "rw")!!.use { pfd ->
-                extractor.setDataSource(ctx, uri, null)
-                muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                val m = muxer!!
-                if (rotation != 0) m.setOrientationHint(rotation)
-
-                val map = HashMap<Int, Int>()
-                for (t in 0 until extractor.trackCount) {
-                    val f = extractor.getTrackFormat(t)
-                    val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
-                    if (mime.startsWith("video/") || mime.startsWith("audio/")) {
-                        try {
-                            map[t] = m.addTrack(f)
-                            extractor.selectTrack(t)
-                        } catch (e: Exception) {
-                            // piste non supportée par le MP4 : on l'ignore
-                        }
-                    }
-                }
-                if (map.isEmpty()) throw IllegalStateException("Format non compatible MP4")
-
-                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                m.start()
-                started = true
-
-                val buf = ByteBuffer.allocate(4 * 1024 * 1024)
-                val info = MediaCodec.BufferInfo()
-                while (true) {
-                    val t = extractor.sampleTime
-                    if (t < 0 || t >= endUs) break
-                    val mi = map[extractor.sampleTrackIndex]
-                    if (mi == null || t < startUs) {
-                        extractor.advance()
-                        continue
-                    }
-                    buf.clear()
-                    val size = extractor.readSampleData(buf, 0)
-                    if (size < 0) break
-                    val flags = if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0)
-                        MediaCodec.BUFFER_FLAG_SYNC_FRAME else 0
-                    info.set(0, size, t - startUs, flags)
-                    m.writeSampleData(mi, buf, info)
-                    extractor.advance()
-                }
+            resolver.openOutputStream(out)!!.use { os ->
+                file.inputStream().use { it.copyTo(os) }
             }
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
@@ -178,10 +157,7 @@ object VideoSplitter {
         } catch (e: Exception) {
             resolver.delete(out, null, null)
             throw e
-        } finally {
-            try { if (started) muxer?.stop() } catch (_: Exception) {}
-            try { muxer?.release() } catch (_: Exception) {}
-            extractor.release()
         }
+        return out
     }
 }
