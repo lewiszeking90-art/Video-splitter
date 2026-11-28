@@ -17,7 +17,7 @@ jobs:
           mkdir -p $M/java/com/brayan/videosplitter $M/res/values $M/res/drawable $M/res/mipmap-anydpi
           cp app-build.gradle.kts app/build.gradle.kts
           cp AndroidManifest.xml $M/AndroidManifest.xml
-          cp MainActivity.kt VideoSplitter.kt $M/java/com/brayan/videosplitter/
+          cp MainActivity.kt VideoSplitter.kt SplitService.kt $M/java/com/brayan/videosplitter/
           cp colors.xml themes.xml $M/res/values/
           cp ic_launcher_background.xml ic_launcher_foreground.xml $M/res/drawable/
           cp ic_launcher.xml $M/res/mipmap-anydpi/
