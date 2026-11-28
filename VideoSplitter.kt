@@ -5,8 +5,7 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.media3.common.C
@@ -15,13 +14,14 @@ import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlin.math.ceil
 
 data class VideoInfo(val name: String, val durationMs: Long)
@@ -29,13 +29,17 @@ data class VideoInfo(val name: String, val durationMs: Long)
 /** segMs = durée d'une partie, parts = nombre de parties (la dernière va jusqu'à la fin). */
 data class Plan(val segMs: Long, val parts: Int)
 
+class StallException : Exception("Aucune progression")
+
 /**
- * Découpe EXACTE (à la seconde près) avec Media3 Transformer.
- * L'optimisation « trim » ne ré-encode que le début de chaque partie, le reste est copié tel quel.
+ * Découpe EXACTE avec Media3 Transformer.
+ * 1re tentative : mode rapide (ne ré-encode que le début de chaque partie).
+ * Si ça échoue ou se fige : 2e tentative en mode complet (plus lent mais sûr).
  */
 object VideoSplitter {
 
     private const val FOLDER = "DecoupeurVideo"
+    private const val STALL_MS = 90_000L
 
     fun readInfo(ctx: Context, uri: Uri): VideoInfo {
         var name = "video"
@@ -58,7 +62,6 @@ object VideoSplitter {
         if (byDuration) {
             val seg = n * 1000L
             var parts = ceil(durationMs.toDouble() / seg).toInt()
-            // un reste de moins d'une seconde est fusionné avec la partie précédente
             if (parts > 1 && durationMs - (parts - 1) * seg < 1000L) parts--
             return Plan(seg, maxOf(1, parts))
         }
@@ -69,73 +72,107 @@ object VideoSplitter {
         return Plan(seg, parts)
     }
 
-    /** Retourne les Uri des fichiers créés (dans Films/DecoupeurVideo). */
+    /** Doit être appelée depuis le thread principal. Les Uri créées sont ajoutées à [results]. */
     suspend fun split(
         ctx: Context,
         uri: Uri,
         plan: Plan,
+        durationMs: Long,
         baseName: String,
-        onProgress: (done: Int, total: Int) -> Unit
-    ): List<Uri> {
+        results: MutableList<Uri>,
+        onProgress: (done: Int, total: Int, pct: Int) -> Unit
+    ) {
         val stem = baseName.substringBeforeLast('.', baseName)
-        val results = ArrayList<Uri>()
-        onProgress(0, plan.parts)
+        onProgress(0, plan.parts, 0)
 
         for (k in 0 until plan.parts) {
             val startMs = k * plan.segMs
-            val endMs = if (k == plan.parts - 1) C.TIME_END_OF_SOURCE else (k + 1) * plan.segMs
+            val last = k == plan.parts - 1
+            val endMs = if (last) durationMs else (k + 1) * plan.segMs
             val tmp = File(ctx.cacheDir, "partie_tmp.mp4")
-            if (tmp.exists()) tmp.delete()
             try {
-                exportClip(ctx, uri, startMs, endMs, tmp) // doit tourner sur le thread principal
+                tmp.delete()
+                try {
+                    exportClip(ctx, uri, startMs, endMs, tmp, true) { onProgress(k, plan.parts, it) }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    tmp.delete()
+                    val endFull = if (last) C.TIME_END_OF_SOURCE else endMs
+                    exportClip(ctx, uri, startMs, endFull, tmp, false) { onProgress(k, plan.parts, it) }
+                }
                 val name = "%s_partie_%03d.mp4".format(stem, k + 1)
                 val out = withContext(Dispatchers.IO) { saveToGallery(ctx, tmp, name) }
                 results.add(out)
             } finally {
                 tmp.delete()
             }
-            onProgress(k + 1, plan.parts)
+            onProgress(k + 1, plan.parts, 0)
         }
-        return results
     }
 
-    private suspend fun exportClip(ctx: Context, uri: Uri, startMs: Long, endMs: Long, out: File) =
-        suspendCancellableCoroutine<Unit> { cont ->
-            val clip = MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionMs(startMs)
-                .setEndPositionMs(endMs)
-                .build()
-            val item = MediaItem.Builder().setUri(uri).setClippingConfiguration(clip).build()
-            val edited = EditedMediaItem.Builder(item).build()
+    private suspend fun exportClip(
+        ctx: Context, uri: Uri, startMs: Long, endMs: Long, out: File,
+        fast: Boolean, onPct: (Int) -> Unit
+    ) {
+        val clip = MediaItem.ClippingConfiguration.Builder()
+            .setStartPositionMs(startMs)
+            .setEndPositionMs(endMs)
+            .build()
+        val item = MediaItem.Builder().setUri(uri).setClippingConfiguration(clip).build()
+        val edited = EditedMediaItem.Builder(item).build()
 
-            val builder = Transformer.Builder(ctx)
-            // Optimisation : ne ré-encoder que le début (si disponible dans cette version)
+        val finished = CompletableDeferred<Unit>()
+        val builder = Transformer.Builder(ctx)
+        if (fast) {
             runCatching {
                 builder.javaClass
                     .getMethod("experimentalSetTrimOptimizationEnabled", java.lang.Boolean.TYPE)
                     .invoke(builder, true)
             }
-            val transformer = builder
-                .addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        if (cont.isActive) cont.resume(Unit)
-                    }
-
-                    override fun onError(
-                        composition: Composition,
-                        exportResult: ExportResult,
-                        exportException: ExportException
-                    ) {
-                        if (cont.isActive) cont.resumeWithException(exportException)
-                    }
-                })
-                .build()
-
-            cont.invokeOnCancellation {
-                Handler(Looper.getMainLooper()).post { transformer.cancel() }
-            }
-            transformer.start(edited, out.absolutePath)
         }
+        val transformer = builder
+            .addListener(object : Transformer.Listener {
+                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                    finished.complete(Unit)
+                }
+
+                override fun onError(
+                    composition: Composition,
+                    exportResult: ExportResult,
+                    exportException: ExportException
+                ) {
+                    finished.completeExceptionally(exportException)
+                }
+            })
+            .build()
+
+        transformer.start(edited, out.absolutePath)
+
+        val holder = ProgressHolder()
+        var lastPct = -1
+        var lastChange = SystemClock.elapsedRealtime()
+        try {
+            while (!finished.isCompleted) {
+                delay(500)
+                if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                    val p = holder.progress
+                    onPct(p)
+                    if (p != lastPct) {
+                        lastPct = p
+                        lastChange = SystemClock.elapsedRealtime()
+                    }
+                }
+                if (fast && SystemClock.elapsedRealtime() - lastChange > STALL_MS) {
+                    throw StallException()
+                }
+            }
+            finished.await()
+        } catch (e: Throwable) {
+            transformer.cancel()
+            throw e
+        }
+    }
 
     private fun saveToGallery(ctx: Context, file: File, fileName: String): Uri {
         val values = ContentValues().apply {

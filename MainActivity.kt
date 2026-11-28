@@ -1,8 +1,11 @@
 package com.brayan.videosplitter
 
+import android.Manifest
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.graphics.Color as AColor
 import android.net.Uri
 import android.os.Bundle
@@ -51,10 +54,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,14 +65,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.flow.update
 
 private val Primary = Color(0xFF12A150)
 private val Dark = Color(0xFF0A5C3A)
@@ -130,34 +131,46 @@ private fun shareFiles(ctx: Context, uris: List<Uri>) {
 @Composable
 fun App() {
     val ctx = LocalContext.current
-    val view = LocalView.current
-    val scope = rememberCoroutineScope()
+    val st by SplitState.flow.collectAsState()
 
     var uri by remember { mutableStateOf<Uri?>(null) }
     var info by remember { mutableStateOf<VideoInfo?>(null) }
     var byDuration by remember { mutableStateOf(true) }
     var valueText by remember { mutableStateOf("90") }
-    var running by remember { mutableStateOf(false) }
-    var done by remember { mutableStateOf(0) }
-    var total by remember { mutableStateOf(0) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var job by remember { mutableStateOf<Job?>(null) }
-    var resultUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
-    var showDone by remember { mutableStateOf(false) }
 
-    view.keepScreenOn = running
+    val running = st.running
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { u ->
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u ->
         if (u != null) {
+            runCatching {
+                ctx.contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
             uri = u
             info = runCatching { VideoSplitter.readInfo(ctx, u) }.getOrNull()
-            error = null
-            done = 0
+            SplitState.flow.value = SplitUi()
         }
     }
 
     val n = valueText.toLongOrNull() ?: 0L
     val plan = info?.let { VideoSplitter.plan(it.durationMs, byDuration, n) }
+
+    fun startSplit() {
+        val u = uri ?: return
+        val p = plan ?: return
+        val inf = info ?: return
+        SplitState.flow.value = SplitUi(running = true, total = p.parts)
+        val intent = Intent(ctx, SplitService::class.java)
+            .putExtra(SplitService.EXTRA_URI, u.toString())
+            .putExtra(SplitService.EXTRA_SEG_MS, p.segMs)
+            .putExtra(SplitService.EXTRA_PARTS, p.parts)
+            .putExtra(SplitService.EXTRA_DURATION_MS, inf.durationMs)
+            .putExtra(SplitService.EXTRA_NAME, inf.name)
+        ContextCompat.startForegroundService(ctx, intent)
+    }
+
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+        startSplit()
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(Bg)) {
 
@@ -206,7 +219,7 @@ fun App() {
                             .height(96.dp)
                             .clip(RoundedCornerShape(16.dp))
                             .background(Mint)
-                            .clickable(enabled = !running) { picker.launch("video/*") },
+                            .clickable(enabled = !running) { picker.launch(arrayOf("video/*")) },
                         contentAlignment = Alignment.Center
                     ) {
                         Text("Appuie pour choisir une vidéo", color = Dark, fontWeight = FontWeight.Medium)
@@ -216,7 +229,7 @@ fun App() {
                     Spacer(Modifier.height(2.dp))
                     Text("Durée : ${fmt(info!!.durationMs)}", color = Muted, fontSize = 14.sp)
                     Spacer(Modifier.height(10.dp))
-                    TextButton(onClick = { picker.launch("video/*") }, enabled = !running) {
+                    TextButton(onClick = { picker.launch(arrayOf("video/*")) }, enabled = !running) {
                         Text("Changer de vidéo", color = Primary, fontWeight = FontWeight.SemiBold)
                     }
                 }
@@ -287,26 +300,10 @@ fun App() {
             // Bouton découper
             Button(
                 onClick = {
-                    val u = uri ?: return@Button
-                    val p = plan ?: return@Button
-                    val name = info?.name ?: "video"
-                    job = scope.launch {
-                        running = true
-                        error = null
-                        done = 0
-                        total = p.parts
-                        try {
-                            val uris = VideoSplitter.split(ctx, u, p, name) { d, t -> done = d; total = t }
-                            resultUris = uris
-                            showDone = true
-                        } catch (e: CancellationException) {
-                            error = "Découpe annulée."
-                        } catch (e: Exception) {
-                            error = "Erreur : ${e.message}"
-                        } finally {
-                            running = false
-                        }
-                    }
+                    val needsPerm = Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+                    if (needsPerm) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) else startSplit()
                 },
                 enabled = !running && uri != null && plan != null,
                 shape = RoundedCornerShape(18.dp),
@@ -321,31 +318,42 @@ fun App() {
 
             // Progression
             if (running) {
+                val frac = if (st.total > 0) (st.done + st.pct / 100f) / st.total else 0f
                 CardBox {
                     Text("Découpe en cours…", fontWeight = FontWeight.SemiBold, color = Ink)
                     Spacer(Modifier.height(10.dp))
-                    if (done == 0) {
+                    if (frac <= 0f) {
                         LinearProgressIndicator(
                             color = Primary, trackColor = Mint,
                             modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape)
                         )
                     } else {
                         LinearProgressIndicator(
-                            progress = { done.toFloat() / total },
+                            progress = { frac.coerceIn(0f, 1f) },
                             color = Primary, trackColor = Mint,
                             modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape)
                         )
                     }
                     Spacer(Modifier.height(8.dp))
-                    Text("$done / $total parties terminées", color = Muted, fontSize = 14.sp)
-                    Text("Garde l'application ouverte jusqu'à la fin.", color = Muted, fontSize = 13.sp)
-                    TextButton(onClick = { job?.cancel() }) {
+                    Text(
+                        "Partie ${minOf(st.done + 1, st.total)} / ${st.total} · ${st.pct} %",
+                        color = Muted, fontSize = 14.sp
+                    )
+                    Text(
+                        "Tu peux quitter l'application : la découpe continue en arrière-plan.",
+                        color = Muted, fontSize = 13.sp
+                    )
+                    TextButton(onClick = {
+                        ctx.startService(
+                            Intent(ctx, SplitService::class.java).setAction(SplitService.ACTION_CANCEL)
+                        )
+                    }) {
                         Text("Annuler", color = ErrorRed, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
 
-            error?.let {
+            st.error?.let {
                 Text(it, color = ErrorRed, fontWeight = FontWeight.Medium)
             }
 
@@ -354,9 +362,9 @@ fun App() {
     }
 
     // ---------- Fenêtre « terminé » ----------
-    if (showDone) {
+    if (st.finished) {
         AlertDialog(
-            onDismissRequest = { showDone = false },
+            onDismissRequest = { SplitState.flow.update { it.copy(finished = false) } },
             containerColor = Color.White,
             shape = RoundedCornerShape(28.dp),
             icon = {
@@ -365,14 +373,14 @@ fun App() {
             title = { Text("Découpe terminée !", fontWeight = FontWeight.Bold, color = Ink) },
             text = {
                 Text(
-                    "${resultUris.size} partie(s) enregistrée(s) dans Films/DecoupeurVideo.\n\n" +
+                    "${st.results.size} partie(s) enregistrée(s) dans Films/DecoupeurVideo.\n\n" +
                         "Appuie sur Partager pour les envoyer ou les enregistrer où tu veux.",
                     color = Muted
                 )
             },
             confirmButton = {
                 Button(
-                    onClick = { shareFiles(ctx, resultUris) },
+                    onClick = { shareFiles(ctx, st.results) },
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Primary, contentColor = Color.White)
                 ) {
@@ -382,7 +390,7 @@ fun App() {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDone = false }) {
+                TextButton(onClick = { SplitState.flow.update { it.copy(finished = false) } }) {
                     Text("Fermer", color = Muted, fontWeight = FontWeight.SemiBold)
                 }
             }
